@@ -1,0 +1,134 @@
+---
+title: "Analysis of Barbell lift quality"
+author: "joergandi"
+date: "18 August 2015"
+output: html_document
+---
+
+## Overview
+The Weight Lifting Exercises Dataset (Velloso et al. "Qualitative Activity Recognition of Weight Lifting Exercises", http://groupware.les.inf.puc-rio.br/har ) uses 4 accelerometers during a barbell lifting exercise by 6 subjects and provides 5 labels for the quality of the exercise execution. In the following, we derive a machine learning model to automatically classify the exercise quality.
+
+## Executive Summary
+We find that a random forest classifier outperforms boosted trees and linear and nonlinear (radial basis) svms, achieving an expected out-of-sample error of 0.55%.
+
+## Exploratory Analysis
+We load the training dataset, remove all columns with missing or invalid entries, remove timestamp and username columns and use all remaining variables as features. An initial look at the inhomogeneous value ranges suggests a preprocessing step to center and scale the variables (computed on the training set, stored inside model structure for application on the test set).
+
+```{r explor, echo=TRUE, tidy=FALSE}
+#rm(list = ls())
+library(caret) #unified ml interface
+data<-read.csv("pml-training.csv", na.strings = c("NA", ""))
+#head(data)
+invalid <- unlist(lapply(data, function(x) any(is.na(x)) || any(is.nan(x)) || any(!is.numeric(x)) ))
+validnames<-colnames(data)[!invalid]
+validnames<-validnames[5:length(validnames)] #remove timestamps etc
+data2<-subset(data,select=validnames)
+subjects<-as.factor(data$user_name)
+labels<-as.factor(data$classe)
+full<-cbind(data2,labels)
+``` 
+
+## Training
+We set a reproducible seed ad split the training data into training and validation sets, randomly drawing over all subjects. An alternative would have been to split by subject to test for generalization over new subjects. We enable parallelization of the different crossvalidation runs over the available processor cores to speed up the training process. 
+
+```{r train1, echo=TRUE, tidy=FALSE}
+set.seed(42)
+trainsize = 0.75  #75% training data, 25% validation data
+trainid<-createDataPartition(y=full$labels,p=trainsize,list=FALSE)
+train<-full[trainid,]
+valid<-full[-trainid,]
+# use all cores for crossvalidation inside caret::train
+library(doParallel)
+numcores<-detectCores()
+cl <- makeCluster(numcores) 
+registerDoParallel(cl)
+ctrl <- trainControl(method = "cv", number = numcores, allowParallel = TRUE)
+```
+
+We evaluate four models and choose the one achieving the best accuracy on the validation set. The evaluated models are linear as well as nonlinear approaches, boosting and ensembles to assure a reasonable coverage. As explained above, we use a preprocessing to scale and center the data which is computed on the training set and stored inside model structure for application on the test set. The SVM-based methods require a gridsearch over a few reasonable values for the error cost parameter C. All models are otherwise trained with caret default settings.
+
+```{r train2, echo=TRUE, cache=TRUE, tidy=FALSE}
+# random forest: nonlinear, tree-based ensemble
+model.rf <- train(labels~.,data=train,method="rf",
+                  preProcess=c("center","scale"),trControl = ctrl)
+
+svmTuneGrid <- data.frame( .C = c(0.01,0.1,0.5,1,2,4,8,16,32))  #gridsearch for soft error cost of svm-based methods
+
+#radial basis svm: nonlinear, robust against overfitting
+model.svmRadialCost <- train(labels~.,data=train, method="svmRadialCost",
+                             preProcess=c("center","scale"),tuneGrid = svmTuneGrid,trControl = ctrl)
+
+#linear svm: fast, simple, as baseline
+model.svmLinear <- train(labels~.,data=train, method="svmLinear",
+                         preProcess=c("center","scale"),tuneGrid = svmTuneGrid,trControl = ctrl)
+
+# boosted trees: nonlinear boosting with trees as weak classifiers
+model.treeboost <- train(labels~.,data=train,method="gbm",
+                         preProcess=c("center","scale"),trControl = ctrl,verbose=FALSE)
+```
+
+We select the model achieving the smallest out-of-sample error on the validation set. 
+
+```{r train3, echo=TRUE, tidy=FALSE}
+#select the one model with the best validation accuracy
+models<-list(model.rf,model.svmRadialCost,model.svmLinear ,model.treeboost );
+bestvalid<-0
+for (model in models) {
+  trainest<-predict(model,newdata=train)  #for info only
+  validest<-predict(model,newdata=valid)
+  #table(trainest, train$labels)
+  ctrain<-confusionMatrix(data = trainest, reference = train$labels)  #for info only
+  cvalid<-confusionMatrix(data = validest, reference = valid$labels)
+  if (bestvalid<cvalid$overall["Accuracy"]) {
+    bestvalid<-cvalid$overall["Accuracy"]
+    bestmodel<-model
+    bestc<-cvalid
+  }
+}
+print(bestc)
+print(bestvalid)
+stopCluster(cl);
+```
+
+The training / validation accuracies for this random seed are:
+
+- linear SVM: 80.5%, 79.7%
+
+- boosted trees: 97.4%, 96.5%
+
+- radial basis SVM: 99.37%, 98.9%
+
+- random forest: 99.9%, 99.45%
+
+The random forest classifier is selected, expecting an out-of-sample error of 0.55%. We plot its confusion matrix on the validation set.
+
+```{r valid, echo=TRUE, fig.height=8, fig.width=8, tidy=FALSE}
+library(reshape2)
+data<-melt(bestc$table)
+ggplot(data, aes(as.factor(Prediction), Reference, group=Reference)) +
+       geom_tile(aes(fill = value)) + 
+       geom_text(aes(fill = data$value, label = round(data$value, 1))) +
+       scale_fill_gradient(low = "white", high = "red") 
+```
+
+## Testing
+
+We load the test data, select the same columns as in the training step and apply the selected model using the preprocessing settings from the training set.
+
+```{r test, echo=TRUE, tidy=FALSE}
+testdata<-read.csv("pml-testing.csv", na.strings = c("NA", ""))
+testdata2<-subset(testdata,select=validnames)
+testest<-predict(bestmodel,newdata=testdata2)
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(testest)
+# B A B A A E D B A A B C B A E E A B B B
+```
+
